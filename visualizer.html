@@ -64,6 +64,10 @@
     background: var(--ok); box-shadow: 0 0 8px 2px var(--ok);
     flex:none;
   }
+  .eyebrow.live::before{
+    background: var(--hot); box-shadow: 0 0 8px 2px var(--hot);
+    animation: pulse 1.1s ease-in-out infinite;
+  }
   h1{
     font-family: var(--font-display);
     font-weight: 700;
@@ -185,10 +189,47 @@
     34%{ opacity:1; }
     100%{ opacity:1; }
   }
+  @keyframes pulse{
+    0%, 100%{ opacity:1; }
+    50%{ opacity:.35; }
+  }
   @media (prefers-reduced-motion: reduce){
     .console{ animation:none; }
     .scanline{ display:none; }
   }
+
+  /* ---- widget mode: strip everything but the visualizer, for docking
+     in a corner as a standalone desktop accessory ---- */
+  .widget-exit{
+    position:absolute; top:6px; right:6px; z-index:5;
+    width:22px; height:22px; padding:0; border-radius:2px;
+    display:none; align-items:center; justify-content:center;
+    font-size:12px; line-height:1; opacity:0; transition:opacity .15s;
+  }
+  body.widget{
+    background: var(--bg);
+    padding:0; align-items:flex-start; justify-content:flex-start;
+    min-height:0;
+  }
+  body.widget .console{ max-width:200px; width:200px; animation:none; }
+  body.widget .scanline,
+  body.widget header,
+  body.widget .status-panel,
+  body.widget .spec-panel,
+  body.widget footer,
+  body.widget .hint,
+  body.widget .transport{ display:none; }
+  body.widget .stage-panel{
+    border:none; background:transparent; padding:2px; margin-top:0;
+  }
+  body.widget .stage-panel::before,
+  body.widget .stage-panel::after{ display:none; }
+  body.widget .stage{ padding:0; }
+  body.widget .center-read .db{ font-size:15px; }
+  body.widget .center-read .db-unit{ font-size:8px; }
+  body.widget canvas#bars{ height:28px; margin-top:3px; }
+  body.widget .widget-exit{ display:flex; }
+  body.widget .stage-panel:hover .widget-exit{ opacity:.85; }
 </style>
 
 <div class="console">
@@ -199,7 +240,7 @@
     <div class="sub">Voice uplink — real-time waveform</div>
   </header>
 
-  <div class="panel">
+  <div class="panel status-panel">
     <div class="status-row">
       <div class="stat">
         <span class="k">Link</span>
@@ -211,7 +252,7 @@
       </div>
       <div class="stat">
         <span class="k">Voice model</span>
-        <span class="v" id="statVoice">en_US-ljspeech-high</span>
+        <span class="v" id="statVoice">en_GB-vctk-medium &middot; spk 103</span>
       </div>
       <div class="stat">
         <span class="k">Elapsed</span>
@@ -220,7 +261,8 @@
     </div>
   </div>
 
-  <div class="panel">
+  <div class="panel stage-panel">
+    <button class="widget-exit" id="widgetExitBtn" type="button" title="Exit widget mode (W)">&#10005;</button>
     <div class="stage">
       <div class="ring-wrap">
         <canvas id="ring" width="420" height="420"></canvas>
@@ -237,11 +279,13 @@
       <button class="primary" id="loadBtn" type="button">&#128225; Load transmission</button>
       <button id="playBtn" type="button" disabled>&#9654; Transmit</button>
       <button class="hot" id="stopBtn" type="button" disabled>&#9632; Halt</button>
+      <button id="watchBtn" type="button">&#128225; Watch clips folder</button>
+      <button id="widgetBtn" type="button" title="Strip down to just the visualizer (W)">&#10529; Widget mode</button>
     </div>
-    <p class="hint">Load a clip to watch Echo speak — grab <code>~/.cache/claude-speak/last.wav</code> after any response, or drop in the file <kbd>SUPER+R</kbd> just replayed.</p>
+    <p class="hint">Live-watches the <code>~/.cache/claude-speak/</code> folder once you grant access — auto-plays (muted; <kbd>paplay</kbd> already makes it audible) every time Echo speaks, and shows which terminal window it was. Or load a clip manually to test. Needs a Chromium-based browser.</p>
   </div>
 
-  <div class="panel">
+  <div class="panel spec-panel">
     <div class="spec-title">Transmission profile — derelict vox chain</div>
     <div class="spec-grid">
       <div class="spec"><span class="k">Bandpass</span><span class="v">150&ndash;3400 Hz</span></div>
@@ -283,11 +327,37 @@
   let audioEl = null;
   let audioCtx = null;
   let analyser = null;
+  let outputGain = null;
   let sourceNode = null;
   let freqData = null;
   let timeData = null;
   let playing = false;
   let peakFlash = 0;
+
+  // watch-mode (auto-play last.wav) state
+  let watchHandle = null;
+  let watchTimer = null;
+  let watchLastModified = 0;
+  let watching = false;
+  let watchSource = null;
+  let playingWatch = false;
+  let watchPlaybackStart = 0;
+  let watchDuration = 0;
+
+  function isActive() { return playing || playingWatch; }
+
+  async function ensureAudioGraph() {
+    if (audioCtx) return;
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 256;
+    analyser.smoothingTimeConstant = 0.75;
+    freqData = new Uint8Array(analyser.frequencyBinCount);
+    timeData = new Uint8Array(analyser.fftSize);
+    outputGain = audioCtx.createGain();
+    analyser.connect(outputGain);
+    outputGain.connect(audioCtx.destination);
+  }
 
   // ---- hi-DPI canvas sizing: crisp at any window/monitor size ----
   let ringSize = 0;   // CSS px, square
@@ -364,7 +434,7 @@
 
   loadBtn.addEventListener('click', () => fileInput.click());
 
-  fileInput.addEventListener('change', () => {
+  fileInput.addEventListener('change', async () => {
     const file = fileInput.files && fileInput.files[0];
     if (!file) return;
 
@@ -373,18 +443,11 @@
     audioEl = new Audio(url);
     audioEl.crossOrigin = 'anonymous';
 
-    if (!audioCtx) {
-      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      analyser = audioCtx.createAnalyser();
-      analyser.fftSize = 256;
-      analyser.smoothingTimeConstant = 0.75;
-      freqData = new Uint8Array(analyser.frequencyBinCount);
-      timeData = new Uint8Array(analyser.fftSize);
-    }
+    await ensureAudioGraph();
+    outputGain.gain.value = 1; // manual test clips should be audible
     if (sourceNode) { try { sourceNode.disconnect(); } catch (e) {} }
     sourceNode = audioCtx.createMediaElementSource(audioEl);
     sourceNode.connect(analyser);
-    analyser.connect(audioCtx.destination);
 
     statSource.textContent = file.name;
     statSource.classList.remove('idle');
@@ -431,12 +494,202 @@
     playBtn.innerHTML = '&#9654; Transmit';
   });
 
+  // ---- watch mode: live-follow the ~/.cache/claude-speak/ directory ----
+  // No server/daemon in this project (see CLAUDE.md), so "live" here means
+  // polling a File System Access directory handle for last.wav's mtime and
+  // auto-playing whatever lands there — muted, since the speak_stop.py
+  // hook's own `paplay` call already makes it audible system-side. Granting
+  // the whole directory (not just last.wav) also lets this read
+  // now_playing.json, which speak_enqueue.py writes with the title of
+  // whichever terminal window is currently speaking — that's the Source
+  // label below.
+  const supportsFSA = 'showDirectoryPicker' in window;
+  const DB_NAME = 'echo-vox', STORE = 'handles', HANDLE_KEY = 'claude-speak-dir';
+  const eyebrow = document.querySelector('.eyebrow');
+
+  function idbOpen() {
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open(DB_NAME, 1);
+      req.onupgradeneeded = () => req.result.createObjectStore(STORE);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+  async function idbGet(key) {
+    const db = await idbOpen();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE, 'readonly');
+      const req = tx.objectStore(STORE).get(key);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+  async function idbSet(key, val) {
+    const db = await idbOpen();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE, 'readwrite');
+      tx.objectStore(STORE).put(val, key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  async function pickWatchDir() {
+    try {
+      return await window.showDirectoryPicker({ id: 'claude-speak', mode: 'read' });
+    } catch (e) {
+      return null; // user cancelled
+    }
+  }
+
+  function setWatchUI(state) {
+    // state: 'off' | 'watching' | 'resume'
+    eyebrow.classList.toggle('live', state === 'watching');
+    if (state === 'watching') {
+      watchBtn.textContent = '\u{1F4E1} Stop watching';
+      watchBtn.classList.add('hot');
+    } else if (state === 'resume') {
+      watchBtn.textContent = '\u{1F4E1} Resume watching';
+      watchBtn.classList.remove('hot');
+    } else {
+      watchBtn.textContent = '\u{1F4E1} Watch clips folder';
+      watchBtn.classList.remove('hot');
+    }
+  }
+
+  async function startWatching(handle) {
+    watchHandle = handle;
+    try { await idbSet(HANDLE_KEY, handle); } catch (e) {}
+    watching = true;
+    setWatchUI('watching');
+    if (!playingWatch) setLink('Watching', 'ok');
+    if (statSource.textContent === 'No signal') statSource.textContent = 'Waiting for a terminal…';
+    statSource.classList.remove('idle');
+    clearInterval(watchTimer);
+    watchTimer = setInterval(pollWatchDir, 400);
+    pollWatchDir();
+  }
+
+  function stopWatching() {
+    watching = false;
+    clearInterval(watchTimer);
+    watchTimer = null;
+    setWatchUI('off');
+    if (!playingWatch) setLink('Standby', 'idle');
+  }
+
+  async function pollWatchDir() {
+    if (!watchHandle) return;
+    let perm;
+    try { perm = await watchHandle.queryPermission({ mode: 'read' }); }
+    catch (e) { return; }
+    if (perm !== 'granted') return;
+
+    // Source label: which terminal window is (or was last) speaking.
+    try {
+      const jsonHandle = await watchHandle.getFileHandle('now_playing.json');
+      const meta = JSON.parse(await (await jsonHandle.getFile()).text());
+      if (meta && meta.title) {
+        statSource.textContent = meta.title;
+        statSource.classList.remove('idle');
+      }
+    } catch (e) { /* no now_playing.json yet — nothing has spoken since this was wired up */ }
+
+    let file;
+    try {
+      const wavHandle = await watchHandle.getFileHandle('last.wav');
+      file = await wavHandle.getFile();
+    } catch (e) { return; } // file may not exist yet
+    if (file.lastModified === watchLastModified) return;
+    watchLastModified = file.lastModified;
+    playWatchedFile(file);
+  }
+
+  async function playWatchedFile(file) {
+    await ensureAudioGraph();
+    if (audioCtx.state === 'suspended') { try { await audioCtx.resume(); } catch (e) {} }
+    let arrBuf, audioBuf;
+    try {
+      arrBuf = await file.arrayBuffer();
+      audioBuf = await audioCtx.decodeAudioData(arrBuf);
+    } catch (e) { return; } // caught mid-write; next poll will pick up the settled file
+
+    if (watchSource) { try { watchSource.stop(); } catch (e) {} try { watchSource.disconnect(); } catch (e) {} }
+    outputGain.gain.value = 0; // silent: paplay already makes this audible
+    watchSource = audioCtx.createBufferSource();
+    watchSource.buffer = audioBuf;
+    watchSource.connect(analyser);
+    watchPlaybackStart = audioCtx.currentTime;
+    watchDuration = audioBuf.duration;
+    playingWatch = true;
+    setLink('Transmitting', 'hot');
+    statTime.classList.remove('idle');
+    watchSource.onended = () => {
+      playingWatch = false;
+      setLink(watching ? 'Watching' : 'Standby', watching ? 'ok' : 'idle');
+    };
+    watchSource.start();
+  }
+
+  watchBtn.addEventListener('click', async () => {
+    if (watching) { stopWatching(); return; }
+    let handle = watchHandle;
+    if (handle) {
+      try {
+        const perm = await handle.queryPermission({ mode: 'read' });
+        if (perm !== 'granted') {
+          const req = await handle.requestPermission({ mode: 'read' });
+          if (req !== 'granted') handle = null;
+        }
+      } catch (e) { handle = null; }
+    }
+    if (!handle) handle = await pickWatchDir();
+    if (!handle) return;
+    startWatching(handle);
+  });
+
+  if (!supportsFSA) {
+    watchBtn.disabled = true;
+    watchBtn.title = 'Live watch needs a Chromium-based browser (File System Access API)';
+  } else {
+    (async () => {
+      try {
+        const stored = await idbGet(HANDLE_KEY);
+        if (!stored) return;
+        watchHandle = stored;
+        const perm = await stored.queryPermission({ mode: 'read' });
+        if (perm === 'granted') startWatching(stored);
+        else setWatchUI('resume');
+      } catch (e) {}
+    })();
+  }
+
+  // ---- widget mode: strip chrome down to just the ring + bars, for
+  // docking as a standalone desktop accessory (see philVault notes) ----
+  const widgetBtn = document.getElementById('widgetBtn');
+  const widgetExitBtn = document.getElementById('widgetExitBtn');
+
+  function setWidgetMode(on) {
+    document.body.classList.toggle('widget', on);
+    const params = new URLSearchParams(location.search);
+    if (on) params.set('widget', '1'); else params.delete('widget');
+    const qs = params.toString();
+    history.replaceState(null, '', location.pathname + (qs ? '?' + qs : ''));
+    requestAnimationFrame(layout); // canvas footprint changed size
+  }
+  widgetBtn.addEventListener('click', () => setWidgetMode(true));
+  widgetExitBtn.addEventListener('click', () => setWidgetMode(false));
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'w' || e.key === 'W') setWidgetMode(!document.body.classList.contains('widget'));
+  });
+  if (new URLSearchParams(location.search).get('widget') === '1') setWidgetMode(true);
+
   // ---- rendering ----
   const N_BANDS = 8; // matches the 8 grille rings
 
   function bandAmps() {
     const amps = new Array(N_BANDS);
-    if (playing && analyser) {
+    if (isActive() && analyser) {
       analyser.getByteFrequencyData(freqData);
       const bins = freqData.length;
       for (let b = 0; b < N_BANDS; b++) {
@@ -458,7 +711,7 @@
   }
 
   function fineAmpAt(angle) {
-    if (!(playing && analyser)) return 0;
+    if (!(isActive() && analyser)) return 0;
     const bins = freqData.length;
     const frac = (angle % (Math.PI * 2)) / (Math.PI * 2);
     const bi = Math.floor(frac * bins * 0.85);
@@ -561,7 +814,7 @@
 
     // dB readout
     let dbVal = '−∞';
-    if (playing && analyser) {
+    if (isActive() && analyser) {
       analyser.getByteTimeDomainData(timeData);
       let sum = 0;
       for (let i = 0; i < timeData.length; i++) {
@@ -581,7 +834,7 @@
     const bw = (barsW - gap * (bars - 1)) / bars;
 
     let amps;
-    if (playing && analyser) {
+    if (isActive() && analyser) {
       analyser.getByteFrequencyData(freqData);
       amps = new Array(bars);
       const bins = freqData.length;
@@ -607,11 +860,25 @@
     }
   }
 
+  let loopRunning = false;
   function loop(t) {
+    if (document.hidden) { loopRunning = false; return; } // stop burning CPU while parked off-screen
+    if (playingWatch) {
+      const elapsed = Math.min(watchDuration, audioCtx.currentTime - watchPlaybackStart);
+      statTime.textContent = fmtTime(elapsed) + ' / ' + fmtTime(watchDuration);
+    }
     drawGrille(t);
     drawBars(t);
     requestAnimationFrame(loop);
   }
-  requestAnimationFrame(loop);
+  function ensureLoopRunning() {
+    if (loopRunning || document.hidden) return;
+    loopRunning = true;
+    requestAnimationFrame(loop);
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) { requestAnimationFrame(layout); ensureLoopRunning(); }
+  });
+  ensureLoopRunning();
 })();
 </script>
