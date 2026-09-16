@@ -18,6 +18,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 
 VOICES_DIR = os.path.expanduser("~/.local/share/piper/voices")
 CONFIG_PATH = os.path.expanduser("~/.config/claude-speak/config.json")
@@ -206,7 +207,7 @@ def vox_filter_cmd(vox, raw_wav, out_wav):
     return f"{duration_setup} && {ffmpeg_cmd}"
 
 
-def speak_async(text, cfg, window):
+def speak_async(text, cfg, window, seq):
     voice_model = os.path.join(VOICES_DIR, cfg["voice_model"])
     if not os.path.exists(voice_model):
         return
@@ -238,10 +239,13 @@ def speak_async(text, cfg, window):
 
     # Render to a temp file, then hand it to the queue so concurrent
     # terminals speak one at a time instead of talking over each other.
+    # seq was captured at Stop-hook fire time (before rendering, which
+    # varies a lot with the vox effect on) so playback order tracks turn
+    # order instead of whichever clip happens to finish rendering first.
     cmd = (
         f"mkdir -p {shlex.quote(CACHE_DIR)} && {render_cmd} "
         f"&& python3 {shlex.quote(ENQUEUE_SCRIPT)} {shlex.quote(final_wav)} "
-        f"{shlex.quote(address)} {shlex.quote(title)}; {cleanup}"
+        f"{shlex.quote(address)} {shlex.quote(title)} {seq}; {cleanup}"
     )
     subprocess.Popen(
         ["bash", "-c", cmd],
@@ -253,6 +257,11 @@ def speak_async(text, cfg, window):
 
 
 def main():
+    # Captured before any rendering happens, so it reflects turn order
+    # even though rendering (Piper + the vox effect) takes a variable
+    # amount of time per clip.
+    seq = time.time_ns()
+
     if os.path.exists(MUTE_FLAG):
         return
 
@@ -276,7 +285,7 @@ def main():
     summary = abbreviate(text, cfg["max_chars"])
     if summary:
         window = get_owner_window()
-        speak_async(summary, cfg, window)
+        speak_async(summary, cfg, window, seq)
 
 
 if __name__ == "__main__":
