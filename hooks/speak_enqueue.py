@@ -8,7 +8,9 @@ Instead every finished clip is dropped into a shared queue directory and
 whichever invocation gets there when the queue is empty grabs an flock and
 plays everything in it (including anything added by other invocations
 while it's working), in turn order (see `seq` below) rather than in the
-order clips happen to finish rendering.
+order clips happen to finish rendering - including waiting out a
+still-rendering earlier turn (via its <seq>.pending marker) instead of
+draining early just because the queue looked empty at that instant.
 
 Also drops a copy of the clip keyed by the owning terminal window's stable
 Hyprland address (independent of playback order) so a later "recap the
@@ -32,6 +34,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 
 CACHE_DIR = os.path.expanduser("~/.cache/claude-speak")
 QUEUE_DIR = os.path.join(CACHE_DIR, "queue")
@@ -39,6 +42,13 @@ BY_WINDOW_DIR = os.path.join(CACHE_DIR, "by-window")
 LAST_WAV = os.path.join(CACHE_DIR, "last.wav")
 NOW_PLAYING = os.path.join(CACHE_DIR, "now_playing.json")
 LOCK_PATH = os.path.join(CACHE_DIR, "queue.lock")
+
+# How long the worker will wait for a lower-seq <seq>.pending marker (see
+# speak_stop.py) to turn into an actual clip before giving up on it. Bounds
+# the damage from a crashed/killed render: without this, its abandoned
+# marker would look like "an earlier turn is still coming" forever and
+# permanently stall playback for every terminal, not just its own.
+PENDING_MAX_AGE_NS = 10 * 1_000_000_000
 
 
 def atomic_copy(src, dst):
@@ -59,7 +69,34 @@ def drain_queue_if_free():
 
     try:
         while True:
-            jobs = sorted(f for f in os.listdir(QUEUE_DIR) if f.endswith(".json"))
+            entries = os.listdir(QUEUE_DIR)
+            jobs = sorted(f for f in entries if f.endswith(".json"))
+            next_seq = int(jobs[0][:-5]) if jobs else None
+
+            # A .pending marker with a lower seq than the job we're about
+            # to play (or any marker at all, if no job has landed yet)
+            # means an earlier turn's clip may still be rendering - wait
+            # for it rather than let this later one jump the queue and get
+            # played (and heard) out of turn order.
+            stale_cutoff = time.time_ns() - PENDING_MAX_AGE_NS
+            still_rendering = False
+            for f in entries:
+                if not f.endswith(".pending"):
+                    continue
+                pending_seq = int(f[:-8])
+                if next_seq is not None and pending_seq >= next_seq:
+                    continue
+                if pending_seq < stale_cutoff:
+                    try:
+                        os.remove(os.path.join(QUEUE_DIR, f))
+                    except OSError:
+                        pass
+                    continue
+                still_rendering = True
+            if still_rendering:
+                time.sleep(0.1)
+                continue
+
             if not jobs:
                 break
             job_json = os.path.join(QUEUE_DIR, jobs[0])

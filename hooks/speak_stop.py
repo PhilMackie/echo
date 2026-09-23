@@ -11,6 +11,7 @@ All tunables (voice, speed, and the optional "derelict vox" radio effect)
 live in ~/.config/claude-speak/config.json — edit that file, no code changes
 needed. Missing keys fall back to the defaults below.
 """
+import hashlib
 import json
 import os
 import re
@@ -23,6 +24,8 @@ import time
 VOICES_DIR = os.path.expanduser("~/.local/share/piper/voices")
 CONFIG_PATH = os.path.expanduser("~/.config/claude-speak/config.json")
 CACHE_DIR = os.path.expanduser("~/.cache/claude-speak")
+QUEUE_DIR = os.path.join(CACHE_DIR, "queue")
+LAST_SPOKEN_DIR = os.path.join(CACHE_DIR, "last_spoken")
 LAST_WAV = os.path.join(CACHE_DIR, "last.wav")
 MUTE_FLAG = os.path.join(CACHE_DIR, "muted")
 ENQUEUE_SCRIPT = os.path.expanduser("~/.claude/hooks/speak_enqueue.py")
@@ -74,7 +77,15 @@ def load_config():
     return cfg
 
 
-def last_assistant_text(transcript_path):
+def last_assistant_entry(transcript_path):
+    """Returns (uuid, text) of the last assistant transcript entry that
+    actually has text content. Claude Code can fire the Stop hook for a
+    turn that itself has no text (e.g. a stray thinking-only entry still
+    tagged stop_reason=end_turn, seen 2026-09-23) - such entries are
+    skipped here rather than counted, since main() needs the uuid of the
+    entry that actually carries what should be spoken, not just whatever
+    happens to be last in the file at that instant."""
+    uuid = None
     text = None
     with open(transcript_path) as f:
         for line in f:
@@ -89,9 +100,30 @@ def last_assistant_text(transcript_path):
                 continue
             content = entry.get("message", {}).get("content", [])
             blocks = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
-            if blocks:
-                text = "\n\n".join(blocks)
-    return text
+            combined = "\n\n".join(blocks).strip()
+            if combined:
+                uuid = entry.get("uuid")
+                text = combined
+    return uuid, text
+
+
+def last_spoken_marker_path(transcript_path):
+    digest = hashlib.sha1(transcript_path.encode()).hexdigest()[:16]
+    return os.path.join(LAST_SPOKEN_DIR, digest)
+
+
+def get_last_spoken_uuid(transcript_path):
+    try:
+        with open(last_spoken_marker_path(transcript_path)) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def set_last_spoken_uuid(transcript_path, uuid):
+    os.makedirs(LAST_SPOKEN_DIR, exist_ok=True)
+    with open(last_spoken_marker_path(transcript_path), "w") as f:
+        f.write(uuid)
 
 
 def abbreviate(text, max_chars):
@@ -212,6 +244,17 @@ def speak_async(text, cfg, window, seq):
     if not os.path.exists(voice_model):
         return
 
+    # Written synchronously, before rendering starts, so the queue worker
+    # (speak_enqueue.py) can tell "an earlier turn is still rendering" from
+    # "there's nothing else coming" and wait for it instead of playing a
+    # later turn's clip first just because it finished rendering sooner -
+    # sorting the queue by seq (see speak_enqueue.py) only orders clips
+    # that are already sitting in the queue at the same time; it doesn't
+    # stop the worker from declaring victory and draining early.
+    os.makedirs(QUEUE_DIR, exist_ok=True)
+    pending_marker = os.path.join(QUEUE_DIR, f"{seq}.pending")
+    open(pending_marker, "w").close()
+
     fd, text_file = tempfile.mkstemp(suffix=".txt")
     with os.fdopen(fd, "w") as f:
         f.write(text)
@@ -245,7 +288,8 @@ def speak_async(text, cfg, window, seq):
     cmd = (
         f"mkdir -p {shlex.quote(CACHE_DIR)} && {render_cmd} "
         f"&& python3 {shlex.quote(ENQUEUE_SCRIPT)} {shlex.quote(final_wav)} "
-        f"{shlex.quote(address)} {shlex.quote(title)} {seq}; {cleanup}"
+        f"{shlex.quote(address)} {shlex.quote(title)} {seq}; "
+        f"rm -f {shlex.quote(pending_marker)}; {cleanup}"
     )
     subprocess.Popen(
         ["bash", "-c", cmd],
@@ -254,6 +298,46 @@ def speak_async(text, cfg, window, seq):
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
+
+
+# How long resolve_and_speak() will wait, in a detached background process,
+# for a genuinely-new transcript entry to land before giving up. Claude Code
+# can fire Stop for a turn that carries no text of its own (seen 2026-09-23:
+# a stray thinking-only entry tagged stop_reason=end_turn) with the real
+# text entry landing anywhere from ~0.5s to ~2.5s later, observed - this
+# needs real margin above that, and unlike the render wait it's free to be
+# generous since nothing upstream is blocked on it (see resolve_and_speak).
+RESOLVE_TIMEOUT = 15
+RESOLVE_POLL_INTERVAL = 0.2
+
+
+def resolve_and_speak(transcript_path, seq):
+    """Runs in a detached background process (spawned by main(), which
+    returns immediately) so waiting for the real text entry - which can
+    take several seconds - never risks whatever timeout Claude Code puts
+    on Stop hook execution itself. Same reasoning that already keeps
+    rendering out of main(): a hook is expected to return fast.
+
+    Dedups by the transcript entry's uuid (scoped per transcript file) so
+    a phantom/premature Stop firing can't fall back to re-speaking a turn
+    already spoken minutes ago - see the 2026-09-23 gotcha in Echo's
+    echo-vox-widget-architecture memory."""
+    already_spoken = get_last_spoken_uuid(transcript_path)
+    uuid, text = last_assistant_entry(transcript_path)
+    deadline = time.monotonic() + RESOLVE_TIMEOUT
+    while uuid == already_spoken and time.monotonic() < deadline:
+        time.sleep(RESOLVE_POLL_INTERVAL)
+        uuid, text = last_assistant_entry(transcript_path)
+
+    if not text or uuid == already_spoken:
+        return
+    set_last_spoken_uuid(transcript_path, uuid)
+
+    cfg = load_config()
+    summary = abbreviate(text, cfg["max_chars"])
+    if summary:
+        window = get_owner_window()
+        speak_async(summary, cfg, window, seq)
 
 
 def main():
@@ -277,16 +361,19 @@ def main():
     if not transcript_path or not os.path.exists(transcript_path):
         return
 
-    text = last_assistant_text(transcript_path)
-    if not text:
-        return
-
-    cfg = load_config()
-    summary = abbreviate(text, cfg["max_chars"])
-    if summary:
-        window = get_owner_window()
-        speak_async(summary, cfg, window, seq)
+    # Hand off to resolve_and_speak() in a detached child so this hook
+    # itself returns immediately - see its docstring.
+    subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "--resolve", transcript_path, str(seq)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) == 4 and sys.argv[1] == "--resolve":
+        resolve_and_speak(sys.argv[2], int(sys.argv[3]))
+    else:
+        main()
