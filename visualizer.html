@@ -154,6 +154,7 @@
   button.primary:not(:disabled){ box-shadow: 0 0 0 1px var(--accent) inset; }
   button.hot{ border-color: var(--hot); color:var(--hot); }
   button.hot:hover:not(:disabled){ background: rgba(255,59,141,0.14); }
+  button.mute-active{ border-color: var(--hot); color:var(--hot); background: rgba(255,59,141,0.14); }
 
   .hint{ font-size:12px; color:var(--ink-faint); margin-top:10px; max-width:60ch; line-height:1.5; }
   .hint code{ color:var(--ink-dim); }
@@ -198,38 +199,6 @@
     .scanline{ display:none; }
   }
 
-  /* ---- widget mode: strip everything but the visualizer, for docking
-     in a corner as a standalone desktop accessory ---- */
-  .widget-exit{
-    position:absolute; top:6px; right:6px; z-index:5;
-    width:22px; height:22px; padding:0; border-radius:2px;
-    display:none; align-items:center; justify-content:center;
-    font-size:12px; line-height:1; opacity:0; transition:opacity .15s;
-  }
-  body.widget{
-    background: var(--bg);
-    padding:0; align-items:flex-start; justify-content:flex-start;
-    min-height:0;
-  }
-  body.widget .console{ max-width:200px; width:200px; animation:none; }
-  body.widget .scanline,
-  body.widget header,
-  body.widget .status-panel,
-  body.widget .spec-panel,
-  body.widget footer,
-  body.widget .hint,
-  body.widget .transport{ display:none; }
-  body.widget .stage-panel{
-    border:none; background:transparent; padding:2px; margin-top:0;
-  }
-  body.widget .stage-panel::before,
-  body.widget .stage-panel::after{ display:none; }
-  body.widget .stage{ padding:0; }
-  body.widget .center-read .db{ font-size:15px; }
-  body.widget .center-read .db-unit{ font-size:8px; }
-  body.widget canvas#bars{ height:28px; margin-top:3px; }
-  body.widget .widget-exit{ display:flex; }
-  body.widget .stage-panel:hover .widget-exit{ opacity:.85; }
 </style>
 
 <div class="console">
@@ -262,7 +231,6 @@
   </div>
 
   <div class="panel stage-panel">
-    <button class="widget-exit" id="widgetExitBtn" type="button" title="Exit widget mode (W)">&#10005;</button>
     <div class="stage">
       <div class="ring-wrap">
         <canvas id="ring" width="420" height="420"></canvas>
@@ -280,7 +248,7 @@
       <button id="playBtn" type="button" disabled>&#9654; Transmit</button>
       <button class="hot" id="stopBtn" type="button" disabled>&#9632; Halt</button>
       <button id="watchBtn" type="button">&#128225; Watch clips folder</button>
-      <button id="widgetBtn" type="button" title="Strip down to just the visualizer (W)">&#10529; Widget mode</button>
+      <button id="muteBtn" type="button" title="Pause Echo's spoken responses (writes the Piper TTS mute flag)">&#128266; Disable voice</button>
     </div>
     <p class="hint">Live-watches the <code>~/.cache/claude-speak/</code> folder once you grant access — auto-plays (muted; <kbd>paplay</kbd> already makes it audible) every time Echo speaks, and shows which terminal window it was. Or load a clip manually to test. Needs a Chromium-based browser.</p>
   </div>
@@ -595,6 +563,16 @@
       }
     } catch (e) { /* no now_playing.json yet — nothing has spoken since this was wired up */ }
 
+    // Mute state: speak_stop.py checks for this same sentinel file before
+    // speaking, and toggle_speak.sh (SUPER+M) creates/removes it — so pick
+    // up changes made from outside this page too.
+    try {
+      await watchHandle.getFileHandle('muted');
+      if (!muted) setMuteUI(true);
+    } catch (e) {
+      if (muted) setMuteUI(false);
+    }
+
     let file;
     try {
       const wavHandle = await watchHandle.getFileHandle('last.wav');
@@ -664,25 +642,59 @@
     })();
   }
 
-  // ---- widget mode: strip chrome down to just the ring + bars, for
-  // docking as a standalone desktop accessory (see philVault notes) ----
-  const widgetBtn = document.getElementById('widgetBtn');
-  const widgetExitBtn = document.getElementById('widgetExitBtn');
+  // ---- mute toggle: writes/removes ~/.cache/claude-speak/muted, the same
+  // sentinel toggle_speak.sh uses, so this button and SUPER+M stay in sync
+  // (see pollWatchDir's check above). Needs readwrite permission on the
+  // same directory handle watch-mode already uses.
+  const muteBtn = document.getElementById('muteBtn');
+  let muted = false;
 
-  function setWidgetMode(on) {
-    document.body.classList.toggle('widget', on);
-    const params = new URLSearchParams(location.search);
-    if (on) params.set('widget', '1'); else params.delete('widget');
-    const qs = params.toString();
-    history.replaceState(null, '', location.pathname + (qs ? '?' + qs : ''));
-    requestAnimationFrame(layout); // canvas footprint changed size
+  function setMuteUI(on) {
+    muted = on;
+    const icon = on ? '&#128263;' : '&#128266;';
+    muteBtn.innerHTML = icon + ' ' + (on ? 'Enable voice' : 'Disable voice');
+    muteBtn.classList.toggle('mute-active', on);
+    muteBtn.title = on
+      ? "Echo's voice is paused — click to resume"
+      : "Pause Echo's spoken responses (writes the Piper TTS mute flag)";
   }
-  widgetBtn.addEventListener('click', () => setWidgetMode(true));
-  widgetExitBtn.addEventListener('click', () => setWidgetMode(false));
-  window.addEventListener('keydown', (e) => {
-    if (e.key === 'w' || e.key === 'W') setWidgetMode(!document.body.classList.contains('widget'));
-  });
-  if (new URLSearchParams(location.search).get('widget') === '1') setWidgetMode(true);
+
+  async function ensureWriteHandle() {
+    let handle = watchHandle;
+    if (!handle) {
+      handle = await pickWatchDir();
+      if (!handle) return null;
+      startWatching(handle);
+    }
+    try {
+      let perm = await handle.queryPermission({ mode: 'readwrite' });
+      if (perm !== 'granted') perm = await handle.requestPermission({ mode: 'readwrite' });
+      if (perm !== 'granted') return null;
+    } catch (e) { return null; }
+    return handle;
+  }
+
+  async function toggleMute() {
+    const handle = await ensureWriteHandle();
+    if (!handle) return;
+    try {
+      if (muted) {
+        await handle.removeEntry('muted');
+        setMuteUI(false);
+      } else {
+        const fh = await handle.getFileHandle('muted', { create: true });
+        const w = await fh.createWritable();
+        await w.close();
+        setMuteUI(true);
+      }
+    } catch (e) { /* e.g. raced with an external toggle — next poll resyncs */ }
+  }
+  muteBtn.addEventListener('click', toggleMute);
+
+  if (!supportsFSA) {
+    muteBtn.disabled = true;
+    muteBtn.title = 'Voice toggle needs a Chromium-based browser (File System Access API)';
+  }
 
   // ---- rendering ----
   const N_BANDS = 8; // matches the 8 grille rings
